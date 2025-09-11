@@ -1,0 +1,68 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+.build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+.venv311/
+venv*/
+.venv*/
+ENV*/
+env*/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTest & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# --- Project data & artifacts ---
+data/
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.joblib
+*.model
+models/
+!models/.gitkeep
+
+# Logs & temp
+logs/
+*.log
+tmp/
+temp/
+
+# --- Environment / secrets ---
+.env
+*.env
+.env.*
+.env.local
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Node (in case of front-end assets) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
