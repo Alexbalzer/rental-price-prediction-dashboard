@@ -15,10 +15,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score, median_absolute_error
 import joblib
 
-# --- Pfade ---
-DEFAULT_TRAIN_CSV   = "./data/clean/immo_train_joined.csv"   # oder immo_train_ready.csv
-DEFAULT_MODEL_PATH  = "../data/pricing_model.pkl"
-DEFAULT_METRICS_PATH= "../models/metrics.json"
+from pathlib import Path
+
+# Projektroot = eine Ebene über /scripts
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_MODEL_PATH   = str((PROJECT_ROOT / "data"   / "pricing_model.pkl").resolve())
+DEFAULT_METRICS_PATH = str((PROJECT_ROOT / "models" / "metrics.json").resolve())
+DEFAULT_TRAIN_CSV    = str((PROJECT_ROOT / "data"   / "clean" / "immo_train_joined.csv").resolve())
+
 
 # --- Ziel & Features ---
 TARGET = "rent_cold"

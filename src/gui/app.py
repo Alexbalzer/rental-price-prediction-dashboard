@@ -7,9 +7,18 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 import streamlit as st
+from gui.helpers import load_zensus0005, load_ags_map, resolve_location_defaults, load_dashboard_frames
+
 from sqlmodel import select
 from dotenv import load_dotenv
 from datetime import date
+import pandas as pd
+import numpy as np
+import joblib
+import subprocess
+import textwrap
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 
 from hausverwaltung.db import init_db, get_session
@@ -28,19 +37,169 @@ st.title("🏠 Hausverwaltung – MVP")
 
 with st.sidebar:
     st.header("Navigation")
-    # in der Navigation:
-    page = st.radio("Seite", ["Dashboard", "Stammdaten", "Verträge & Zahlungen", "Mietpreis-Vorschlag", "Dokumente", "Daten & Training", "Einstellungen"])
+    page = st.radio(
+        "Seite",
+        ["Dashboard", "Stammdaten", "Verträge & Zahlungen", "Mietpreis-Vorschlag",
+         "Dokumente", "Daten & Training", "Preis-Sandbox", "Einstellungen","📖 Projektbeschreibung"]
+    )
+
+# with st.sidebar:
+#     st.header("Navigation")
+#     # in der Navigation:
+#     page = st.radio("Seite", ["Dashboard", "Stammdaten", "Verträge & Zahlungen", "Mietpreis-Vorschlag", "Dokumente", "Daten & Training", "Einstellungen"])
 
 
 # ---------------- Dashboard ----------------
 if page == "Dashboard":
+    import altair as alt
+    import pydeck as pdk
+
     st.subheader("Überblick")
-    with get_session() as sess:
-        leases_open = sess.exec(select(Lease).where(Lease.end_date == None)).all()  # noqa: E711
-        payments_this_month = sess.exec(select(Payment).where(Payment.paid_on >= date.today().replace(day=1))).all()
-        st.metric("Aktive Verträge", len(leases_open))
-        st.metric("Zahlungen (seit Monatsanfang)", len(payments_this_month))
-    st.info("Dies ist ein MVP. Weitere KPIs (Ausfallquote, fällige Mahnungen, Leerstand) folgen.")
+
+    # aktive CSV für Dashboard/Sandbox
+    DEFAULT_JOINED = Path("./data/clean/immo_train_joined.csv")
+    immo_csv = Path(st.session_state.get("data_csv_path", DEFAULT_JOINED))
+
+    try:
+        immo, z5 = load_dashboard_frames(immo_csv)
+    except Exception as e:
+        st.error(f"Dataset konnte nicht geladen werden: {e}")
+        st.stop()
+
+    # Kennzahlen
+    total_offers = len(immo)
+    by_state = immo["state"].fillna("Unbekannt").value_counts().reset_index()
+    by_state.columns = ["Bundesland","Anzahl"]
+    by_city = immo["city"].fillna("Unbekannt").value_counts().head(15).reset_index()
+    by_city.columns = ["Stadt","Anzahl"]
+
+    colA, colB, colC = st.columns(3)
+    colA.metric("Inserate gesamt", f"{total_offers:,}".replace(",", "."))
+    colB.metric("Bundesländer mit Inseraten", by_state["Bundesland"].nunique())
+    colC.metric("Top-Stadt (Anzahl)", f"{by_city.iloc[0]['Stadt'] if len(by_city)>0 else '-'} ({int(by_city.iloc[0]['Anzahl']) if len(by_city)>0 else 0})")
+
+    st.markdown("### Verteilung nach Bundesland")
+    chart_state = (
+        alt.Chart(by_state)
+        .mark_bar()
+        .encode(
+            x=alt.X("Anzahl:Q", title="Inserate"),
+            y=alt.Y("Bundesland:N", sort="-x", title=""),
+            tooltip=["Bundesland", "Anzahl"]
+        )
+        .properties(height=400)
+    )
+    st.altair_chart(chart_state, use_container_width=True)
+
+    st.markdown("### Top-Städte")
+    chart_city = (
+        alt.Chart(by_city)
+        .mark_bar()
+        .encode(
+            x=alt.X("Anzahl:Q", title="Inserate"),
+            y=alt.Y("Stadt:N", sort="-x", title=""),
+            tooltip=["Stadt", "Anzahl"]
+        )
+        .properties(height=400)
+    )
+    st.altair_chart(chart_city, use_container_width=True)
+
+    # --- Kaltmiete: Ist vs. Zensus-Erwartung --------------------------------
+    st.markdown("### Kaltmiete: Ist vs. Zensus-Erwartung")
+    df_rent = immo.copy()
+    # robuste Zielspalte (falls netRent fehlt)
+    if df_rent["netRent"].isna().all() and "warmRent" in df_rent.columns:
+        # optional heuristik: warm->cold (nur Demo)
+        df_rent["netRent"] = df_rent["warmRent"] * 0.8
+
+    df_rent = df_rent.dropna(subset=["area_sqm"])
+    df_rent["eur_m2"] = df_rent.apply(
+        lambda r: r["netRent"]/r["area_sqm"] if pd.notna(r["netRent"]) and r["area_sqm"]>0 else np.nan, axis=1
+    )
+    view = df_rent.dropna(subset=["eur_m2","zensus_rate"]).copy()
+    if len(view) == 0:
+        st.info("Keine vergleichbaren Daten vorhanden (netRent/area/zensus_rate fehlen).")
+    else:
+        view["Bundesland"] = view["state"].fillna("Unbekannt")
+        chart_scatter = (
+            alt.Chart(view.sample(min(5000, len(view)), random_state=42))
+            .mark_circle(size=35, opacity=0.45)
+            .encode(
+                x=alt.X("zensus_rate:Q", title="Zensus €/m²"),
+                y=alt.Y("eur_m2:Q", title="Ist €/m²"),
+                color=alt.Color("Bundesland:N", legend=None),
+                tooltip=["city","PLZ","Bundesland","area_sqm","eur_m2","zensus_rate"]
+            )
+            .properties(height=400)
+        )
+        st.altair_chart(chart_scatter, use_container_width=True)
+
+        # Differenz-Boxplot (Ist - Zensus)
+        view["delta_eur_m2"] = view["eur_m2"] - view["zensus_rate"]
+        chart_delta = (
+            alt.Chart(view)
+            .mark_boxplot(extent="min-max")
+            .encode(
+                x=alt.X("Bundesland:N", sort="-y", title=""),
+                y=alt.Y("delta_eur_m2:Q", title="Δ €/m² (Ist − Zensus)"),
+                tooltip=["Bundesland","delta_eur_m2"]
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(chart_delta, use_container_width=True)
+
+    # --- Feature-Statistik nach PLZ -----------------------------------------
+    st.markdown("### Feature-Statistiken (nach PLZ)")
+    feat = immo.copy()
+    # nur PLZ mit Format
+    feat = feat[feat["PLZ"].notna()]
+    agg = feat.groupby("PLZ").agg(
+        n=("PLZ","count"),
+        balkon=("balcony","sum"),
+        kueche=("hasKitchen","sum"),
+        garten=("garden","sum"),
+        lift=("lift","sum"),
+    ).reset_index()
+
+    top_plz = agg.sort_values("n", ascending=False).head(25)
+    chart_feats = (
+        alt.Chart(top_plz.melt(id_vars=["PLZ","n"], value_vars=["balkon","kueche","garten","lift"], var_name="Feature", value_name="Anzahl"))
+        .mark_bar()
+        .encode(
+            x=alt.X("Anzahl:Q"),
+            y=alt.Y("PLZ:N", sort="-x"),
+            color=alt.Color("Feature:N"),
+            tooltip=["PLZ","Feature","Anzahl","n"]
+        )
+        .properties(height=500)
+    )
+    st.altair_chart(chart_feats, use_container_width=True)
+
+    # --- Interaktive Heatmap (falls Koordinaten vorhanden) -------------------
+    st.markdown("### Karte – Dichte der Inserate")
+    has_coords = immo[["lat","lon"]].dropna().shape[0] > 0
+    if has_coords:
+        df_map = immo.dropna(subset=["lat","lon"]).copy()
+        init_view = {
+            "latitude": float(df_map["lat"].astype(float).median()),
+            "longitude": float(df_map["lon"].astype(float).median()),
+            "zoom": 5, "pitch": 40
+        }
+        layer = pdk.Layer(
+            "HexagonLayer",
+            data=df_map,
+            get_position=["lon","lat"],
+            radius=9000, elevation_scale=30, elevation_range=[0, 3000],
+            extruded=True, pickable=True,
+        )
+        tooltip = {"html": "<b>Anzahl:</b> {pointCount}", "style": {"color": "white"}}
+        st.pydeck_chart(pdk.Deck(map_style="mapbox://styles/mapbox/dark-v10",
+                                 initial_view_state=init_view,
+                                 layers=[layer],
+                                 tooltip=tooltip))
+        st.caption("Zoom/Drag: Draufzoomen → Dichte wird feiner. Tooltips zeigen Counts.")
+    else:
+        st.info("Keine Koordinaten in der CSV gefunden – zeige stattdessen die Balkencharts je Bundesland/Stadt (siehe oben).")
 
 # ---------------- Stammdaten ----------------
 elif page == "Stammdaten":
@@ -257,3 +416,152 @@ elif page == "Daten & Training":
                 st.caption("Das Modell wurde als `data/pricing_model.pkl` gespeichert.")
             except Exception as e:
                 st.exception(e)
+
+elif page == "📖 Projektbeschreibung":
+    from gui.project_description import description
+    st.markdown(description)
+
+# ---------- Preis-Sandbox -------------------------------------------------
+st.markdown("## 📈 Preis-Sandbox – Modell testen & (neu) trainieren")
+
+# Info: Modellstatus oben anzeigen (pipe wird weiter unten verwendet)
+if "pipe_loaded" not in st.session_state:
+    st.session_state["pipe_loaded"] = False
+
+# ---------------- Standort & Zensus-Defaults ----------------
+with st.container():
+    st.subheader("Eingaben")
+
+    col_loc1, col_loc2 = st.columns([2, 1])
+    with col_loc1:
+        city_input = st.text_input(
+            "Stadt / Gemeinde (optional)",
+            placeholder="z. B. Leipzig, Aachen, Gera …",
+        )
+
+    # Zensus-Periode (gleich den Spalten in 0005_clean1)
+    periode = st.selectbox(
+        "Baujahr-Periode (Zensus-0005)",
+        ["vor_1919", "1919_1949", "1950_1959", "1970_1979",
+         "1980_1989", "2000_2009", "2010_2015", "2016_plus"],
+        index=7,
+    )
+
+    # Zensus-Defaults über Namen ermitteln (falls möglich)
+    defaults = {}
+    if city_input.strip():
+        try:
+            defaults = resolve_location_defaults(city_input, periode=periode)
+        except Exception:
+            defaults = {}
+
+# ---------------- Basis-Features ----------------
+col_l, col_r = st.columns(2)
+
+with col_l:
+    area_sqm   = st.slider("Wohnfläche (m²)", 10.0, 250.0, 67.0, 1.0)
+    rooms      = st.slider("Zimmer", 1.0, 8.0, 2.0, 0.5)
+    floor      = st.slider("Etage",  -1, 50, 1, 1)
+    pricetrend = st.slider("pricetrend", 0.0, 10.0, 3.0, 0.01)
+    serviceCharge = st.slider("Nebenkosten (ServiceCharge, €)", 0.0, 800.0, 180.0, 1.0)
+
+with col_r:
+    garden     = st.checkbox("Garten", True)
+    lift       = st.checkbox("Aufzug", False)
+    hasKitchen = st.checkbox("Einbauküche", True)
+
+    typeOfFlat = st.selectbox(
+        "Wohnungstyp",
+        ["apartment", "ground_floor", "loft", "penthouse", "roof_storey",
+         "terraced_flat", "maisonette", "other"],
+        index=0,
+    )
+
+    heatingType_clean = st.selectbox(
+        "Heizungsart",
+        ["central_heating", "district_heating", "gas_heating", "oil_heating",
+         "heat_pump", "floor_heating", "electric_heating", "other"],
+        index=0,
+    )
+
+# ---------------- Zensus (optional; mit Defaults aus Standort) ----------------
+z_total_default  = float(defaults.get("zensus_total") or 0.0)
+z_dec_default    = float(defaults.get("zensus_decade") or 0.0)
+z_factor_default = float(defaults.get("zensus_factor") or 0.0)
+
+zensus_miete_total  = st.number_input("Zensus: Gesamt €/m² (optional)", value=z_total_default, min_value=0.0, step=0.01)
+zensus_miete_decade = st.number_input("Zensus: Dekade €/m² (optional)", value=z_dec_default,    min_value=0.0, step=0.01)
+zensus_factor_decade = st.number_input("Zensus: Faktor (Dekade/gesamt) (optional)", value=z_factor_default, min_value=0.0, step=0.01)
+
+# ---------------- Modell laden ----------------
+import joblib
+MODEL_PATH = "./data/pricing_model.pkl"
+
+pipe = None
+try:
+    pipe = joblib.load(MODEL_PATH)
+    if not st.session_state["pipe_loaded"]:
+        st.session_state["pipe_loaded"] = True
+        st.success("Modell geladen.")
+except Exception as e:
+    st.error("Kein Modell gefunden oder Laden fehlgeschlagen.")
+    st.caption("Trainiere zuerst unter „Daten & Training“ oder lege eine Datei `data/pricing_model.pkl` ab.")
+    st.exception(e)
+
+# ---------------- Vorhersage ----------------
+st.markdown("### 🔮 Vorhersage")
+if pipe is not None:
+    try:
+        # Eingabezeile so benannt, wie beim Training erwartet
+        X_user = {
+            "area_sqm": area_sqm,
+            "rooms": rooms,
+            "floor": float(floor),
+            "pricetrend": pricetrend,
+            "serviceCharge": serviceCharge,
+            "garden": int(bool(garden)),
+            "lift": int(bool(lift)),
+            "hasKitchen": int(bool(hasKitchen)),
+            "typeOfFlat": typeOfFlat,
+            "heatingType_clean": heatingType_clean,
+            "periode_0005": periode,
+            "zensus_miete_total": zensus_miete_total if zensus_miete_total > 0 else None,
+            "zensus_miete_decade": zensus_miete_decade if zensus_miete_decade > 0 else None,
+            "zensus_factor_decade": zensus_factor_decade if zensus_factor_decade > 0 else None,
+        }
+        import pandas as pd
+        X_user = pd.DataFrame([X_user])
+
+        y_hat = float(pipe.predict(X_user)[0])
+        st.success(f"**Prognose Nettokaltmiete:** {y_hat:,.2f} €")
+        st.caption(f"≈ {y_hat/area_sqm:.2f} €/m²")
+    except Exception as e:
+        st.error("Vorhersage fehlgeschlagen. Prüfe, ob alle benötigten Feature-Spalten vorhanden sind.")
+        st.exception(e)
+
+    # ---------------- Feature-Importances (nur falls Modell das kann) ----------------
+    with st.expander("Feature-Importances", expanded=False):
+        try:
+            rf   = pipe.named_steps.get("rf", None)      # Regressor
+            prep = pipe.named_steps.get("prep", None)    # ColumnTransformer
+
+            if rf is not None and hasattr(rf, "feature_importances_"):
+                # Feature-Namen aus dem Preprocessor holen (falls unterstützt)
+                if prep is not None and hasattr(prep, "get_feature_names_out"):
+                    names = prep.get_feature_names_out()
+                else:
+                    names = [f"f{i}" for i in range(len(rf.feature_importances_))]
+
+                import pandas as pd
+                fi = (pd.DataFrame({"feature": names, "importance": rf.feature_importances_})
+                        .sort_values("importance", ascending=False)
+                        .head(25))
+                st.dataframe(fi, use_container_width=True)
+            else:
+                st.info("Dieses Modell stellt keine Feature-Importances bereit.")
+        except Exception as e:
+            st.caption("Feature-Importances konnten nicht ermittelt werden.")
+            st.exception(e)
+
+
+
