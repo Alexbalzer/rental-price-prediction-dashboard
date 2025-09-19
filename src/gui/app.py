@@ -7,7 +7,6 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 import streamlit as st
-from gui.helpers import load_zensus0005, load_ags_map, resolve_location_defaults, load_dashboard_frames
 from gui.sandbox import render_price_sandbox
 from gui.board import render_dashboard
 from gui.stammdaten import render_stammdaten
@@ -42,7 +41,7 @@ with st.sidebar:
     page = st.radio(
         "Seite",
         ["Dashboard", "Stammdaten", "Verträge & Zahlungen", "Mietpreis-Vorschlag",
-         "Dokumente", "Daten & Training", "Einstellungen","📖 Projektbeschreibung"]
+         "Dokumente", "Daten & Training", "Einstellungen","🧭 Projekt-Guide","📖 Projektbeschreibung"]
     )
 
 # with st.sidebar:
@@ -157,6 +156,10 @@ elif page == "Dokumente":
             st.session_state["doc_refined"] = refined
         st.text_area("Final", value=st.session_state.get("doc_refined", raw), height=260)
 
+# --- Preis-Sandbox: Standort + Zensus-Autofill + Vorhersage
+elif page == "Preis-Sandbox":
+    render_price_sandbox()
+
 # ---------------- Einstellungen ----------------
 elif page == "Einstellungen":
     st.write("### Einstellungen")
@@ -199,6 +202,12 @@ elif page == "Daten & Training":
                 st.caption("Das Modell wurde als `data/pricing_model.pkl` gespeichert.")
             except Exception as e:
                 st.exception(e)
+
+
+elif page == "🧭 Projekt-Guide":
+    from gui.project_guide import guide
+    st.markdown(guide)
+
 
 elif page == "📖 Projektbeschreibung":
     from gui.project_description import description

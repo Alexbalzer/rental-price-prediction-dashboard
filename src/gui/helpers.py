@@ -1,21 +1,31 @@
 # --- ADD-ONs fürs Dashboard: Laden/Normieren/Statistiken --------------------
-
 # src/gui/helpers.py
 from __future__ import annotations
-
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import difflib
-import numpy as np
 import pandas as pd
+import numpy as np
+import difflib
 import streamlit as st
+from typing import Iterable, Optional, List
+
+# --- robuste Hilfen ---------------------------------------------------------
+
+def _first_existing(columns, candidates):
+    """
+    Liefert den *ersten* vorhandenen Spaltennamen aus 'candidates' (case-insensitive),
+    der in 'columns' existiert. Sonst None.
+    """
+    if columns is None:
+        return None
+    cl = {str(c).lower(): c for c in columns}
+    for cand in candidates:
+        c = cl.get(str(cand).lower())
+        if c:
+            return c
+    return None
 
 
-# --------------------------- Utilities ---------------------------
-
-def _norm(s: str | None) -> str:
-    """Einfache Normalisierung für Namen/Orte (für fuzzy matching)."""
+# ---------- Normalisierung für Namen ----------
+def _norm(s: str) -> str:
     if s is None:
         return ""
     s = str(s).lower().strip()
@@ -35,232 +45,115 @@ def _norm(s: str | None) -> str:
     return s.strip()
 
 
-def _first_existing(candidates: List[str | Path]) -> Optional[Path]:
-    """Nimmt die erste existierende Datei aus einer Kandidatenliste."""
-    for c in candidates:
-        p = Path(c)
-        if p.exists():
-            return p
-    return None
-
-
-# ---------------------- Zensus/AGS – alte API ----------------------
-
+# ---------- (NEU) Immo-Datensatz laden & vereinheitlichen ----------
 @st.cache_data(show_spinner=False)
-def load_zensus0005(path: str | Path | None = None) -> pd.DataFrame:
+def load_immo_data(path: str = "./data/clean/immo_train_joined.csv") -> pd.DataFrame:
     """
-    Lädt Zensus 0005 (Gemeindeebene) und konvertiert numerische Spalten.
+    Lädt den Immo-Datensatz und normalisiert auf ein einheitliches Schema:
+    mind. ['state', 'city', 'coldRent'] (+ optionale Felder, falls vorhanden).
 
-    Erwartete Kerne:
-      - GKZ (12-stellig)
-      - Gemeindename
-      - Insgesamt
-      - Perioden-Spalten (z. B. '2016_plus', '1970_1979', ...)
+    Wir akzeptieren viele alternative Spaltennamen und berechnen coldRent,
+    falls nur Warmmiete + Nebenkosten / baseRent vorhanden sind.
     """
-    if path is None:
-        path = _first_existing([
-            "./data/clean/zensus_0005_clean.csv",
-            "./data/clean/zensus_0005_clean1.csv",
-            "./data/clean/zensus_0005_clean_de.csv",
-        ])
-    if path is None:
-        raise FileNotFoundError("Zensus 0005-Datei nicht gefunden (data/clean/...).")
+    df = pd.read_csv(path)
 
-    df = pd.read_csv(path, dtype=str)
-    for c in df.columns:
-        if c not in ("GKZ", "Gemeindename"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["name_norm"] = df["Gemeindename"].map(_norm)
+    # Kandidatenlisten für typische Quellen (ImmoScout, eigene Joins, etc.)
+    state_col   = _first_existing(df.columns, ["state", "federal_state", "bundesland", "region"])
+    city_col    = _first_existing(df.columns, ["city", "ort", "municipality", "place", "stadt"])
+    area_col    = _first_existing(df.columns, ["area_sqm", "livingSpace", "wohnflaeche", "wohnfläche", "size"])
+    rooms_col   = _first_existing(df.columns, ["rooms", "anzahl_zimmer"])
+    cold_col    = _first_existing(df.columns, ["coldRent", "netColdRent", "net_rent", "netRent", "baseRent"])
+    warm_col    = _first_existing(df.columns, ["totalRent", "warmmiete", "warmRent"])
+    nk_col      = _first_existing(df.columns, ["serviceCharge", "nebenkosten"])
+    plz_col     = _first_existing(df.columns, ["plz", "zip_code", "postalCode"])
+    balc_col    = _first_existing(df.columns, ["balcony", "hasBalcony"])
+    kitc_col    = _first_existing(df.columns, ["hasKitchen", "kitchen", "einbaukueche", "einbauküche"])
+
+    # coldRent berechnen, falls nicht vorhanden
+    if cold_col is None:
+        if warm_col and nk_col:
+            df["coldRent"] = pd.to_numeric(df[warm_col], errors="coerce") - pd.to_numeric(df[nk_col], errors="coerce")
+            cold_col = "coldRent"
+        else:
+            # manchmal gibt es 'baseRent'
+            base_col = _first_existing(df.columns, ["baseRent", "baserent"])
+            if base_col:
+                cold_col = base_col
+
+    # Umbenennen ins Zielschema (nur vorhandene Spalten)
+    rename = {}
+    if state_col: rename[state_col] = "state"
+    if city_col:  rename[city_col]  = "city"
+    if cold_col:  rename[cold_col]  = "coldRent"
+    if area_col:  rename[area_col]  = "area_sqm"
+    if rooms_col: rename[rooms_col] = "rooms"
+    if plz_col:   rename[plz_col]   = "plz"
+    if balc_col:  rename[balc_col]  = "balcony"
+    if kitc_col:  rename[kitc_col]  = "hasKitchen"
+
+    df = df.rename(columns=rename)
+
+    # Pflichtfelder prüfen
+    missing = [c for c in ["state", "city", "coldRent"] if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Immo-Datensatz ({path}) konnte nicht normalisiert werden – fehlende Kernspalten: {missing}. "
+            f"Passe ggf. die Spalten-Mappings in helpers.load_immo_data an."
+        )
+
+    # leichte Bereinigung
+    for c in ["state", "city"]:
+        df[c] = df[c].astype(str).str.strip()
+
+    df["coldRent"] = pd.to_numeric(df["coldRent"], errors="coerce")
+
+    # Optional-Flags in ints wandeln (0/1), falls vorhanden
+    for flag in ["balcony", "hasKitchen"]:
+        if flag in df.columns:
+            df[flag] = df[flag].astype(float).fillna(0).astype(int)
+
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_ags_map(path: str | Path | None = None) -> Optional[pd.DataFrame]:
-    """
-    Optionales Mapping PLZ/Ort → AGS/ARS.
-    Erwartete Spalten (variieren je nach Quelle): ARS/AGS, PLZ, Ort, Gemeindename.
-    """
-    if path is None:
-        path = _first_existing([
-            "./data/ags_gkz.csv",
-            "./data/clean/ags_gkz.csv",
-        ])
-    if path is None:
-        return None
-
-    m = pd.read_csv(path, sep=";", dtype=str, encoding="utf-8")
-    cols = {c.lower(): c for c in m.columns}
-
-    def pick(name: str, default: str) -> str:
-        return cols.get(name, default)
-
-    m = m.rename(columns={
-        pick("ars", "ARS"): "ARS",
-        pick("ags", "AGS"): "AGS",
-        pick("gemeindename", "Gemeindename"): "Gemeindename",
-        pick("plz", "PLZ"): "PLZ",
-        pick("ort", "Ort"): "Ort",
-    })
-
-    for need in ("Gemeindename", "Ort", "PLZ", "ARS", "AGS"):
-        if need not in m.columns:
-            return None
-
-    m["name_norm"] = m["Gemeindename"].map(_norm)
-    m["ort_norm"] = m["Ort"].map(_norm)
-    m = m[["ARS", "AGS", "PLZ", "Gemeindename", "Ort", "name_norm", "ort_norm"]].drop_duplicates()
-    return m
-
-
-def resolve_location_defaults(
-    user_city: str,
-    periode: str = "2016_plus",
-    zensus_path: str | Path | None = None,
-    ags_map_path: str | Path | None = None,
-) -> Dict[str, Optional[float | str]]:
-    """
-    Versucht für eine Stadt sinnvolle Default-Werte zu finden:
-      - ARS (falls Mapping vorhanden)
-      - zensus_miete_total (Insgesamt)
-      - zensus_miete_decade (für 'periode')
-      - zensus_factor_decade (decade/gesamt)
-
-    Rückgabe: dict mit 'ARS', 'zensus_total', 'zensus_decade', 'zensus_factor'
-    """
-    out: Dict[str, Optional[float | str]] = {
-        "ARS": None,
-        "zensus_total": None,
-        "zensus_decade": None,
-        "zensus_factor": None,
-    }
-    if not user_city:
-        return out
-
-    z5 = load_zensus0005(zensus_path)
-    m = load_ags_map(ags_map_path)
-    target_norm = _norm(user_city)
-
-    # 1) exakter/fuzzy Treffer im Zensus
-    hit = z5[z5["name_norm"] == target_norm]
-    if hit.empty:
-        choices = z5["name_norm"].unique().tolist()
-        best = difflib.get_close_matches(target_norm, choices, n=1, cutoff=0.87)
-        if best:
-            hit = z5[z5["name_norm"] == best[0]]
-
-    if not hit.empty:
-        row = hit.iloc[0]
-        if pd.notna(row.get("Insgesamt")):
-            out["zensus_total"] = float(row["Insgesamt"])
-        if periode in row.index and pd.notna(row.get(periode)):
-            out["zensus_decade"] = float(row[periode])
-        if out["zensus_total"] and out["zensus_decade"] and out["zensus_total"] not in (0, "0"):
-            out["zensus_factor"] = float(out["zensus_decade"]) / float(out["zensus_total"])
-        if pd.notna(row.get("GKZ")):
-            out["ARS"] = str(row["GKZ"]).strip()
-
-    # 2) ARS ggf. über Mapping
-    if not out["ARS"] and m is not None:
-        mm = m[(m["name_norm"] == target_norm) | (m["ort_norm"] == target_norm)]
-        if mm.empty:
-            pool = pd.unique(pd.concat([m["name_norm"], m["ort_norm"]], ignore_index=True)).tolist()
-            best = difflib.get_close_matches(target_norm, pool, n=1, cutoff=0.9)
-            if best:
-                mm = m[(m["name_norm"] == best[0]) | (m["ort_norm"] == best[0])]
-        if not mm.empty:
-            out["ARS"] = str(mm.iloc[0]["ARS"]).strip()
-
-    return out
-
-
-# ---------------------- Neue API fürs Dashboard ----------------------
-
+# ---- Dashboard-Loader: Immo + Zensus + Aggregationen ----
 @st.cache_data(show_spinner=False)
 def load_dashboard_frames(
-    immo_path: str | Path | None = None,
-    zensus_path: str | Path | None = None,
-    ags_map_path: str | Path | None = None,
-) -> Dict[str, pd.DataFrame]:
+    immo_path: str | None = None,
+    zensus_path: str = "./data/clean/zensus_0005_clean1.csv",
+):
     """
-    Lädt Datenframes, die das Dashboard braucht:
-      - immo (Listings + abgeleitete Spalten + Zensus-Merge, soweit möglich)
-      - agg_state (Anzahl Listings je Bundesland)
-      - agg_city  (Anzahl Listings je Stadt)
-      - miete_vs_zensus_state (Ø €/m² aus Listings vs. Zensus je Bundesland)
-      - features_by_plz (Summen/Counts je PLZ für Balkon/Küche/Lift/Garten)
+    Lädt den normalisierten Immo-Datensatz (load_immo_data) und Zensus 0005 (load_zensus0005)
+    und erzeugt einige sinnvolle Aggregationen fürs Dashboard.
 
-    Robust gegen fehlende Dateien/Spalten; füllt dann mit NaNs/Defaults.
+    Returns
+    -------
+    immo : pd.DataFrame
+        Inserate mit vereinheitlichten Spalten (state, city, plz, area_sqm, rooms, coldRent, ...)
+    z5 : pd.DataFrame
+        Zensus-Tabelle mit numerischen Spalten + 'GKZ'/'name_norm' wenn vorhanden.
+    meta : dict[str, pd.DataFrame]
+        Aggregationen:
+          - agg_state: Anzahl Inserate je Bundesland
+          - agg_city:  Anzahl Inserate je Stadt
+          - feat_by_plz: Summen ausgewählter Feature-Flags (balcony, hasKitchen, garden, lift) je PLZ
     """
-    # --- Pfade auflösen
-    immo_p = Path(immo_path) if immo_path else _first_existing([
-        "./data/immo_data.csv",
-        "./data/clean/immo_data.csv",
-        "./data/clean/immo_clean8.csv",
-    ])
-    if immo_p is None:
-        raise FileNotFoundError("Kann immo_data.csv nicht finden.")
+    # 1) Daten laden
+    immo = load_immo_data(immo_path)
+    z5 = load_zensus0005(zensus_path)
 
-    zensus_p = Path(zensus_path) if zensus_path else _first_existing([
-        "./data/clean/zensus_0005_clean.csv",
-        "./data/clean/zensus_0005_clean1.csv",
-    ])
-    ags_p = Path(ags_map_path) if ags_map_path else _first_existing([
-        "./data/ags_gkz.csv",
-        "./data/clean/ags_gkz.csv",
-    ])
+    # 2) Normspalten
+    immo = immo.copy()
+    immo["city_norm"] = immo["city"].map(_norm)
+    if "name_norm" not in z5.columns and "Gemeindename" in z5.columns:
+        z5["name_norm"] = z5["Gemeindename"].map(_norm)
 
-    # --- IMMO laden
-    immo = pd.read_csv(immo_p)
-    # Spalten robust machen
-    def ensure(col: str, default=np.nan):
-        if col not in immo.columns:
-            immo[col] = default
-
-    for c in ["state", "city", "zipCode", "coldRent", "livingSpace",
-              "balcony", "hasKitchen", "lift", "garden"]:
-        ensure(c, np.nan)
-
-    # Typen/Normierungen
-    immo["state"] = immo["state"].astype(str).str.strip()
-    immo["city"] = immo["city"].astype(str).str.strip()
-    immo["PLZ"] = immo["zipCode"].astype(str).str.extract(r"(\d{5})", expand=False)
-
-    for c in ["coldRent", "livingSpace"]:
-        immo[c] = pd.to_numeric(immo[c], errors="coerce")
-
-    # €/m²
-    immo["coldRentPerSqm"] = immo["coldRent"] / immo["livingSpace"]
-
-    # Feature-Spalten zu int (0/1), wenn bool/Strings vorliegen
-    for c in ["balcony", "hasKitchen", "lift", "garden"]:
-        if c in immo.columns:
-            immo[c] = immo[c].map(lambda x: 1 if str(x).strip().lower() in ("1", "true", "yes", "ja") else 0)
-
-    # --- AGS/ARS-Mapping (optional)
-    if ags_p is not None and ags_p.exists() and "PLZ" in immo.columns:
-        m = load_ags_map(ags_p)
-        if m is not None:
-            immo = immo.merge(m[["PLZ", "ARS"]], on="PLZ", how="left")
-
-    # --- Zensus join (optional)
-    if zensus_p is not None and zensus_p.exists():
-        z5 = load_zensus0005(zensus_p)
-        if "ARS" in immo.columns:
-            immo = immo.merge(z5[["GKZ", "Insgesamt"]], left_on="ARS", right_on="GKZ", how="left")
-            immo.rename(columns={"Insgesamt": "zensus_miete_total"}, inplace=True)
-        else:
-            immo["zensus_miete_total"] = np.nan
-    else:
-        immo["zensus_miete_total"] = np.nan
-
-    # --- Aggregationen
+    # 3) Aggregationen
     agg_state = (
         immo.groupby("state", dropna=False)
             .size()
             .reset_index(name="n_listings")
             .sort_values("n_listings", ascending=False)
     )
-
     agg_city = (
         immo.groupby("city", dropna=False)
             .size()
@@ -268,35 +161,145 @@ def load_dashboard_frames(
             .sort_values("n_listings", ascending=False)
     )
 
-    miete_vs_zensus_state = (
-        immo.groupby("state", dropna=False)
-            .agg(listing_rent=("coldRentPerSqm", "mean"),
-                 zensus_rent=("zensus_miete_total", "mean"),
-                 n=("coldRentPerSqm", "size"))
-            .reset_index()
-            .sort_values("n", ascending=False)
-    )
+    feature_cols = [c for c in ["balcony", "hasKitchen", "garden", "lift"] if c in immo.columns]
+    if feature_cols:
+        feat_by_plz = (
+            immo.groupby("plz", dropna=False)[feature_cols]
+                .sum(numeric_only=True)
+                .reset_index()
+        )
+    else:
+        feat_by_plz = pd.DataFrame(columns=["plz"])
 
-    features_by_plz = (
-        immo.groupby("PLZ", dropna=False)
-            .agg(n=("coldRentPerSqm", "size"),
-                 balcony=("balcony", "sum"),
-                 hasKitchen=("hasKitchen", "sum"),
-                 lift=("lift", "sum"),
-                 garden=("garden", "sum"),
-                 city=("city", "first"),
-                 state=("state", "first"))
-            .reset_index()
-            .sort_values("n", ascending=False)
-    )
-
-    return {
-        "immo": immo,
+    meta = {
         "agg_state": agg_state,
         "agg_city": agg_city,
-        "miete_vs_zensus_state": miete_vs_zensus_state,
-        "features_by_plz": features_by_plz,
+        "feat_by_plz": feat_by_plz,
     }
+    return immo, z5, meta
+
+
+# ---------- Zensus 0005 laden ----------
+@st.cache_data(show_spinner=False)
+def load_zensus0005(path: str = "./data/clean/zensus_0005_clean1.csv") -> pd.DataFrame:
+    """
+    Lädt Zensus-0005 (Gemeindemieten nach Bauperiode) und vereinheitlicht Spalten:
+    - GKZ/ARS/AGS -> 'GKZ'
+    - Gemeindename -> 'Gemeindename'
+    - numerische Periode-Spalten in float
+    - zusätzliche 'name_norm' für Joins
+    """
+    z5 = pd.read_csv(path, dtype=str)
+
+    key_gkz   = _first_existing(z5.columns, ["GKZ", "gkz", "ARS", "ars", "AGS", "ags"])
+    key_name  = _first_existing(z5.columns, ["Gemeindename", "gemeindename", "Gemeinde", "gemeinde", "name"])
+    key_total = _first_existing(z5.columns, ["Insgesamt", "insgesamt", "total"])
+
+    if not key_gkz:
+        raise ValueError(f"Keine GKZ/ARS/AGS-Spalte gefunden. Vorhandene Spalten: {list(z5.columns)}")
+
+    if not key_name:
+        raise ValueError(f"Keine Gemeindename-Spalte gefunden. Vorhandene Spalten: {list(z5.columns)}")
+
+    z5 = z5.rename(columns={key_gkz: "GKZ", key_name: "Gemeindename"})
+    if key_total and key_total != "Insgesamt":
+        z5 = z5.rename(columns={key_total: "Insgesamt"})
+
+    # numerische Spalten -> float
+    for c in z5.columns:
+        if c not in ("GKZ", "Gemeindename"):
+            z5[c] = pd.to_numeric(z5[c], errors="coerce")
+
+    # Normalisierter Name für fuzzy-Join
+    def _norm(s: str) -> str:
+        if s is None:
+            return ""
+        s = str(s).lower().strip()
+        s = (s.replace("ß", "ss")
+               .replace("-", " ")
+               .replace("(", "").replace(")", "")
+               .replace(".", "").replace(",", "")
+               .replace(" hansestadt", "").replace(" stadt", ""))
+        while "  " in s:
+            s = s.replace("  ", " ")
+        return s.strip()
+
+    z5["name_norm"] = z5["Gemeindename"].map(_norm)
+    return z5
+
+
+
+# ---------- (Optionale) AGS/PLZ-Mapping-Tabelle ----------
+@st.cache_data(show_spinner=False)
+def load_ags_map(path: str = "./data/ags_gkz.csv") -> pd.DataFrame | None:
+    try:
+        m = pd.read_csv(path, sep=";", dtype=str, encoding="utf-8")
+    except Exception:
+        return None
+    cols = {c.lower(): c for c in m.columns}
+    m = m.rename(
+        columns={
+            cols.get("ars", "ARS"): "ARS",
+            cols.get("ags", "AGS"): "AGS",
+            cols.get("gemeindename", "Gemeindename"): "Gemeindename",
+            cols.get("plz", "PLZ"): "PLZ",
+            cols.get("ort", "Ort"): "Ort",
+        }
+    )
+    for c in ("Gemeindename", "Ort", "PLZ", "ARS", "AGS"):
+        if c not in m.columns:
+            return None
+    m["name_norm"] = m["Gemeindename"].map(_norm)
+    m["ort_norm"] = m["Ort"].map(_norm)
+    return m[["ARS", "AGS", "PLZ", "Gemeindename", "Ort", "name_norm", "ort_norm"]].drop_duplicates()
+
+
+# ---------- Stadt/Ort → ARS / Zensus-Defaults ----------
+def resolve_location_defaults(
+    user_city: str,
+    periode: str = "2016_plus",
+    zensus_path: str = "./data/clean/zensus_0005_clean1.csv",
+    ags_map_path: str = "./data/ags_gkz.csv",
+) -> dict:
+    """
+    Liefert sinnvolle Default-Werte aus dem Zensus:
+    { 'ARS', 'zensus_total', 'zensus_decade', 'zensus_factor' }
+    """
+    out = {"ARS": None, "zensus_total": None, "zensus_decade": None, "zensus_factor": None}
+    if not user_city:
+        return out
+
+    z5 = load_zensus0005(zensus_path)
+    m = load_ags_map(ags_map_path)
+
+    target_norm = _norm(user_city)
+
+    # exakter/fuzzy Treffer im Zensus
+    hit = z5[z5.get("name_norm", "") == target_norm]
+    if hit.empty and "name_norm" in z5.columns:
+        choices = z5["name_norm"].dropna().unique().tolist()
+        best = difflib.get_close_matches(target_norm, choices, n=1, cutoff=0.87)
+        if best:
+            hit = z5[z5["name_norm"] == best[0]]
+
+    if not hit.empty:
+        row = hit.iloc[0]
+        if "Insgesamt" in row.index:
+            out["zensus_total"] = float(row.get("Insgesamt")) if pd.notna(row.get("Insgesamt")) else None
+        if periode in row.index:
+            zdec = row[periode]
+            out["zensus_decade"] = float(zdec) if pd.notna(zdec) else None
+            if pd.notna(row.get("Insgesamt")) and pd.notna(zdec) and row["Insgesamt"] not in (0, "0"):
+                out["zensus_factor"] = float(zdec) / float(row["Insgesamt"])
+        if pd.notna(row.get("GKZ")):
+            out["ARS"] = str(row["GKZ"]).strip()
+
+    if not out["ARS"] and m is not None:
+        mm = m[(m["name_norm"] == target_norm) | (m["ort_norm"] == target_norm)]
+        if not mm.empty:
+            out["ARS"] = str(mm.iloc[0]["ARS"]).strip()
+
+    return out
 
 
 # from pathlib import Path
@@ -674,3 +677,4 @@ def load_zensus0005(path: str | Path | None = None) -> pd.DataFrame:
 #             out["ARS"] = str(mm.iloc[0]["ARS"]).strip()
 
 #     return out
+''

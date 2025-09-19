@@ -1,5 +1,6 @@
 # ================================
 # file: src/gui/board.py
+# Hier mein Dashboard ausgelagert
 # ================================
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 # src/gui/stammdaten.py
+# Stammdaten anlage Eigentümer, Objekte , Einheiten, Mieter
 from __future__ import annotations
 
 import streamlit as st
