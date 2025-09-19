@@ -522,6 +522,68 @@ def load_dashboard_frames(
 #     z5["name_norm"] = z5["Gemeindename"].map(_norm)
 #     return z5
 
+@st.cache_data(show_spinner=False)
+def load_zensus0005(path: str | Path | None = None) -> pd.DataFrame:
+    """
+    Zensus 0005 laden und Spalten robust normalisieren.
+    Akzeptierte Schlüssel-Spalten: GKZ / ARS / AGS / Amtlicher Gemeindeschlüssel (u.ä.)
+    Akzeptierte Namensspalten: Gemeindename / Gemeinde / Name (u.ä.)
+    """
+    if path is None:
+        path = _first_existing([
+            "./data/clean/zensus_0005_clean.csv",
+            "./data/clean/zensus_0005_clean1.csv",
+            "./data/clean/zensus_0005_clean_de.csv",
+            "./data/clean/zensus_0005_clean8.csv",
+        ])
+    if path is None:
+        raise FileNotFoundError("Zensus 0005-Datei nicht gefunden (data/clean/...).")
+
+    df = pd.read_csv(path, dtype=str)
+
+    # ---- Spalten-Synonyme erkennen ----
+    cols_lc = {c.lower(): c for c in df.columns}
+
+    # GKZ/ARS/AGS finden
+    gkz_col = (
+        cols_lc.get("gkz")
+        or cols_lc.get("ars")
+        or cols_lc.get("ags")
+        or cols_lc.get("amtlicher gemeindeschlüssel")
+        or cols_lc.get("amtlicher gemeindeschluessel")
+        or cols_lc.get("gemeindeschlüssel")
+        or cols_lc.get("gemeindeschluessel")
+    )
+    if not gkz_col:
+        raise ValueError(f"Keine GKZ/ARS/AGS-Spalte gefunden. Vorhandene Spalten: {list(df.columns)}")
+
+    # Gemeindename finden (optional, aber praktisch)
+    name_col = (
+        cols_lc.get("gemeindename")
+        or cols_lc.get("gemeinde")
+        or cols_lc.get("name")
+    )
+
+    renames = {gkz_col: "GKZ"}
+    if name_col:
+        renames[name_col] = "Gemeindename"
+    df = df.rename(columns=renames)
+
+    # ---- Numerik konvertieren (alles außer Identifikatoren) ----
+    skip = {"GKZ", "Gemeindename"}
+    for c in df.columns:
+        if c not in skip:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Normierter Name für fuzzy matching
+    if "Gemeindename" in df.columns:
+        df["name_norm"] = df["Gemeindename"].map(_norm)
+    else:
+        df["name_norm"] = ""
+
+    return df
+
+
 # # ---------- (Optionale) AGS/PLZ-Mapping-Tabelle ----------
 # @st.cache_data(show_spinner=False)
 # def load_ags_map(path: str = "./data/ags_gkz.csv") -> pd.DataFrame | None:
